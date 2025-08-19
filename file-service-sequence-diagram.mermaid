@@ -1,0 +1,112 @@
+sequenceDiagram
+    participant Client as Client Application
+    participant API as File Service API
+    participant Queue as Message Queue
+    participant Worker as Export Worker
+    participant Search as ProductSearchService
+    participant Storage as Cloud Storage (S3/Azure)
+    participant Cache as Redis Cache
+    participant DB as Database
+
+    Note over Client, DB: Export Request Flow
+
+    Client->>+API: POST /api/export/products
+    Note right of Client: Request with search criteria<br/>and export format (CSV/Excel)
+
+    API->>+DB: Save export request
+    DB-->>-API: Return request ID
+
+    API->>+Queue: Enqueue export job
+    Note right of API: Job contains: requestId,<br/>searchCriteria, format, userId
+    Queue-->>-API: Job queued successfully
+
+    API-->>-Client: Return 202 Accepted<br/>{ "requestId": "uuid", "status": "QUEUED" }
+
+    Note over Client, DB: Background Processing
+
+    Worker->>+Queue: Poll for jobs
+    Queue-->>-Worker: Export job details
+
+    Worker->>+Cache: Check for cached results
+    Cache-->>-Worker: Cache miss
+
+    Worker->>+Search: searchProducts(criteria)
+    Note right of Search: Atlas search with<br/>ProductSearchServiceImpl
+    Search-->>-Worker: Product list (paginated)
+
+    loop For each page of results
+        Worker->>+Search: getNextPage()
+        Search-->>-Worker: Product batch
+        Worker->>Worker: Transform to export format
+    end
+
+    Worker->>+Storage: initiate multipart upload
+    Storage-->>-Worker: Upload ID
+
+    loop Upload in chunks
+        Worker->>+Storage: uploadPart(chunk)
+        Storage-->>-Worker: Part ETag
+    end
+
+    Worker->>+Storage: Complete multipart upload
+    Storage-->>-Worker: File URL
+
+    Worker->>+Storage: Generate presigned download URL
+    Note right of Storage: 24-hour expiration
+    Storage-->>-Worker: Presigned URL
+
+    Worker->>+Cache: Cache export result
+    Note right of Cache: Cache for 1 hour
+    Cache-->>-Worker: Cached
+
+    Worker->>+DB: Update export status
+    Note right of DB: Status: COMPLETED<br/>downloadUrl, expiresAt
+    DB-->>-Worker: Updated
+
+    Note over Client, DB: Status Check Flow
+
+    Client->>+API: GET /api/export/status/{requestId}
+    API->>+Cache: Check cached result
+    Cache-->>-API: Cache hit/miss
+
+    alt Cache hit
+        API-->>Client: Return cached status
+    else Cache miss
+        API->>+DB: Get export status
+        DB-->>-API: Export record
+        API-->>-Client: Return status with download URL
+    end
+
+    Note over Client, DB: Download Flow
+
+    Client->>+API: GET /api/export/download/{requestId}
+    API->>+DB: Validate request
+    DB-->>-API: Export record with URL
+
+    alt URL not expired
+        API-->>Client: Redirect to presigned URL
+        Client->>+Storage: Download file directly
+        Storage-->>-Client: File content
+    else URL expired
+        API->>+Storage: Generate new presigned URL
+        Storage-->>-API: New presigned URL
+        API->>+DB: Update URL in database
+        DB-->>-API: Updated
+        API-->>Client: Redirect to new URL
+    end
+
+    Note over Client, DB: Error Handling
+
+    alt Export job fails
+        Worker->>+DB: Update status to FAILED
+        DB-->>-Worker: Updated
+        Worker->>+Queue: Send failure notification
+        Queue-->>-Worker: Notification queued
+    end
+
+    alt File upload fails
+        Worker->>+Storage: Abort multipart upload
+        Storage-->>-Worker: Upload aborted
+        Worker->>+DB: Update status to FAILED
+        DB-->>-Worker: Updated
+    end
