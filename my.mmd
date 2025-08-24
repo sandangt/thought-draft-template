@@ -1,0 +1,95 @@
+sequenceDiagram
+    participant Client
+    participant ExportController
+    participant AtlasSearchExportStrategy
+    participant ExportWorkflowOrchestrator
+    participant ExportValidationService
+    participant ExportTaskManager
+    participant DataStreamingService
+    participant FileGenerationService
+    participant ExportProgressTracker
+    participant AtlasSearchService
+    participant CloudStorageService
+    participant MongoDB
+
+    Client->>ExportController: POST /api/v4/export
+    Note over Client,ExportController: ExportV4RequestDTO with useAtlasSearch=true
+
+    ExportController->>AtlasSearchExportStrategy: execute(request)
+    Note over AtlasSearchExportStrategy: Entry point strategy
+
+    %% Step 1: Delegate to Orchestrator
+    AtlasSearchExportStrategy->>ExportWorkflowOrchestrator: orchestrateExport(request)
+    Note over ExportWorkflowOrchestrator: High-level workflow coordination
+
+    %% Step 2: Configuration & Validation
+    ExportWorkflowOrchestrator->>ExportValidationService: validateRequest(request)
+    ExportValidationService->>ExportValidationService: applyDefaults(request)
+    ExportValidationService->>AtlasSearchService: estimateResultCount(tenantId, condition, filterModel)
+    AtlasSearchService->>MongoDB: Atlas Search count aggregation
+    MongoDB-->>AtlasSearchService: estimated count
+    AtlasSearchService-->>ExportValidationService: estimatedRecords
+    ExportValidationService->>ExportValidationService: validateLimits(request, estimatedRecords)
+    ExportValidationService-->>ExportWorkflowOrchestrator: ValidationResult
+    Note over ExportValidationService: Apply defaults, check limits, validate parameters
+
+    %% Step 3: Create Export Task
+    ExportWorkflowOrchestrator->>ExportTaskManager: createTask(request, estimatedRecords)
+    ExportTaskManager->>ExportTaskManager: generateExportTask(request, estimatedRecords)
+    ExportTaskManager-->>ExportWorkflowOrchestrator: ExportTask
+    Note over ExportTaskManager: Status: PENDING
+
+    %% Step 4: Update Task Status
+    ExportWorkflowOrchestrator->>ExportTaskManager: updateTaskStatus(taskId, PROCESSING)
+    ExportTaskManager-->>ExportWorkflowOrchestrator: updated task
+
+    %% Step 5: Execute Data Streaming
+    ExportWorkflowOrchestrator->>DataStreamingService: executeStreaming(task, request)
+
+    %% Step 5.1: Create File Context
+    DataStreamingService->>FileGenerationService: createStreamingFile(task, request)
+    FileGenerationService->>FileGenerationService: generateObjectKey(request)
+    FileGenerationService->>FileGenerationService: createTempFile()
+    FileGenerationService-->>DataStreamingService: FileContext
+    Note over FileGenerationService: exports/{tenantId}/export_{type}_{timestamp}.{ext}
+
+    %% Step 5.2: Stream Data to File
+    DataStreamingService->>DataStreamingService: streamDataToFile(task, request, formatter, fileContext)
+
+    %% Step 5.2.1: Chunked Data Retrieval Loop
+    loop For each chunk (token-based pagination)
+        DataStreamingService->>AtlasSearchService: searchPoliciesWithSearchAfter(tenantId, chunkSize, searchAfterToken)
+        AtlasSearchService->>MongoDB: Atlas Search aggregation pipeline
+        MongoDB-->>AtlasSearchService: chunk data + nextToken
+        AtlasSearchService-->>DataStreamingService: AtlasSearchPaginatedResult
+
+        loop For each policy in chunk
+            DataStreamingService->>DataStreamingService: convertPolicyToMap(policy)
+            DataStreamingService->>DataStreamingService: formatter.writeRecord(writer, record, columns)
+        end
+
+        DataStreamingService->>ExportProgressTracker: updateProgress(taskId, processedRecords, totalRecords)
+        Note over ExportProgressTracker: Async batched updates every 30s or 10K records
+    end
+
+    %% Step 5.3: Upload to Storage
+    DataStreamingService->>CloudStorageService: uploadFile(bucket, objectKey, contentType, fileStream, metadata)
+    CloudStorageService->>CloudStorageService: MinIO/Azure upload
+    CloudStorageService-->>DataStreamingService: UploadResult
+    DataStreamingService-->>ExportWorkflowOrchestrator: StreamingResult
+
+    %% Step 6: Complete Task
+    ExportWorkflowOrchestrator->>ExportTaskManager: completeTask(task, result)
+    ExportTaskManager->>CloudStorageService: generateDownloadUrl(bucket, objectKey, expirationHours)
+    CloudStorageService-->>ExportTaskManager: presigned download URL
+    ExportTaskManager->>ExportTaskManager: updateTaskWithSuccess(task, result, downloadUrl)
+    ExportTaskManager-->>ExportWorkflowOrchestrator: updated task
+    Note over ExportTaskManager: Status: COMPLETED, files with download URLs
+
+    %% Step 7: Build Response
+    ExportWorkflowOrchestrator->>ExportTaskManager: buildResponse(task)
+    ExportTaskManager-->>ExportWorkflowOrchestrator: ExportJobResponseDTO
+    ExportWorkflowOrchestrator-->>AtlasSearchExportStrategy: ExportJobResponseDTO
+    AtlasSearchExportStrategy-->>ExportController: ExportJobResponseDTO
+    ExportController-->>Client: HTTP 200 with export job details
+    Note over Client,ExportController: Contains download URLs, progress, file info

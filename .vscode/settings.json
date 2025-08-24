@@ -7,5 +7,9 @@
   "excalidraw.theme": "dark",
   "excalidraw.workspaceLibraryPath": "libs/my.excalidrawlib",
   "hediet.vscode-drawio.theme": "min",
-  "hediet.vscode-drawio.appearance": "light"
+  "hediet.vscode-drawio.appearance": "light",
+  "mermaid.vscode.light_theme": "redux-color",
+  "mermaid.vscode.dark_theme": "redux-dark-color",
+  "mermaid.vscode.light": "redux-color",
+  "mermaid.vscode.dark": "redux-dark-color",
 }
